@@ -30,6 +30,7 @@ isn't present, gives far more usable answers.
 """
 
 import os
+import re
 import fitz  # PyMuPDF
 import numpy as np
 import faiss
@@ -46,8 +47,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-base"
+GEN_MODEL_NAME = "google/flan-t5-small"
 GROQ_DEFAULT_MODEL = "llama-3.1-8b-instant"
+MIN_RELEVANCE_SCORE = 0.25
 
 
 def load_embedder():
@@ -85,46 +87,64 @@ def extract_pages(pdf_bytes: bytes):
     return pages
 
 
+def _flush_chunk(chunks, page_number, current_parts):
+    if current_parts:
+        chunks.append({"page": page_number, "text": " ".join(current_parts)})
+
+
+def _split_long_paragraph(chunks, page_number, paragraph, chunk_size):
+    words, current_parts, current_length = paragraph.split(), [], 0
+    for word in words:
+        if current_length + len(word) + 1 > chunk_size and current_parts:
+            chunks.append({"page": page_number, "text": " ".join(current_parts)})
+            current_parts, current_length = [], 0
+        current_parts.append(word)
+        current_length += len(word) + 1
+    if current_parts:
+        chunks.append({"page": page_number, "text": " ".join(current_parts)})
+
+
+def _append_paragraph_to_chunks(chunks, page_number, current_parts, current_len, paragraph, chunk_size):
+    if len(paragraph) > chunk_size:
+        _flush_chunk(chunks, page_number, current_parts)
+        _split_long_paragraph(chunks, page_number, paragraph, chunk_size)
+        return [], 0
+
+    if current_parts and current_len + len(paragraph) > chunk_size:
+        _flush_chunk(chunks, page_number, current_parts)
+        current_parts, current_len = [], 0
+
+    current_parts.append(paragraph)
+    return current_parts, current_len + len(paragraph)
+
+
+def _chunk_page_text(page_number, text, chunk_size):
+    page_chunks = []
+    paragraphs = [para.strip() for para in text.split("\n") if para.strip()]
+    current_parts, current_len = [], 0
+
+    for paragraph in paragraphs:
+        current_parts, current_len = _append_paragraph_to_chunks(
+            page_chunks,
+            page_number,
+            current_parts,
+            current_len,
+            paragraph,
+            chunk_size,
+        )
+
+    _flush_chunk(page_chunks, page_number, current_parts)
+    return page_chunks
+
+
 def chunk_pages(pages, chunk_size=500):
     """Splits each page's text into chunks along paragraph and word
     boundaries — never mid-word. Paragraphs are grouped together up to
     ~chunk_size chars; an overlong paragraph is split on whitespace only.
     """
     chunks = []
-    for p in pages:
-        paragraphs = [para.strip() for para in p["text"].split("\n") if para.strip()]
-
-        current, current_len = [], 0
-
-        def flush():
-            if current:
-                chunks.append({"page": p["page"], "text": " ".join(current)})
-
-        for para in paragraphs:
-            if len(para) > chunk_size:
-                # overlong paragraph: split on word boundaries only
-                flush()
-                current, current_len = [], 0
-                words, buf, buf_len = para.split(), [], 0
-                for w in words:
-                    if buf_len + len(w) + 1 > chunk_size and buf:
-                        chunks.append({"page": p["page"], "text": " ".join(buf)})
-                        buf, buf_len = [], 0
-                    buf.append(w)
-                    buf_len += len(w) + 1
-                if buf:
-                    chunks.append({"page": p["page"], "text": " ".join(buf)})
-                continue
-
-            if current_len + len(para) > chunk_size and current:
-                flush()
-                current, current_len = [], 0
-
-            current.append(para)
-            current_len += len(para)
-
-        flush()
-
+    for page in pages:
+        chunks.extend(_chunk_page_text(page["page"], page["text"], chunk_size))
     return chunks
 
 
@@ -135,6 +155,10 @@ def chunk_pages(pages, chunk_size=500):
 def build_index(chunks, embedder):
     texts = [c["text"] for c in chunks]
     vectors = embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    # faiss requires float32 contiguous arrays with shape (n, dim)
+    vectors = np.asarray(vectors, dtype=np.float32)
+    if vectors.ndim == 1:
+        vectors = vectors[np.newaxis, :]
     dim = vectors.shape[1]
     index = faiss.IndexFlatIP(dim)  # inner product on normalized vecs = cosine sim
     index.add(vectors)
@@ -163,10 +187,52 @@ def retrieve(question, chunks, index, embedder, top_k=4):
 _NOT_FOUND_PHRASE = "I couldn't find this in the document."
 
 
+def _has_relevant_retrieval(retrieved_chunks, min_score=MIN_RELEVANCE_SCORE):
+    return bool(retrieved_chunks) and max((chunk.get("score", 0.0) for chunk in retrieved_chunks), default=0.0) >= min_score
+
+
+def _looks_like_summary_question(question):
+    normalized = " ".join(question.lower().replace("?", " ").replace("'", " ").split())
+    summary_phrases = (
+        "what is this pdf about",
+        "what is the pdf about",
+        "whats the pdf about",
+        "what s the pdf about",
+        "tell me about",
+        "summarize",
+        "summary",
+        "overview",
+        "main topic",
+        "what is this document about",
+        "what is the document about",
+    )
+    return any(phrase in normalized for phrase in summary_phrases)
+
+
 def _build_context(retrieved_chunks, max_chunks=4, max_chars_per_chunk=450):
     used = retrieved_chunks[:max_chunks]
     context_parts = [f"[Page {c['page']}] {c['text'][:max_chars_per_chunk]}" for c in used]
     return "\n\n".join(context_parts), sorted({c["page"] for c in used})
+
+
+def _fallback_overview_from_context(context):
+    snippets = []
+    for block in context.split("\n\n"):
+        match = re.match(r"\[Page\s+\d+\]\s*(.*)", block, flags=re.DOTALL)
+        if not match:
+            continue
+        text = match.group(1).strip()
+        if text:
+            snippets.append(text)
+
+    if not snippets:
+        return _NOT_FOUND_PHRASE
+
+    combined = " ".join(snippets[:2]).replace("\n", " ")
+    combined = re.sub(r"\s+", " ", combined).strip()
+    if len(combined) > 280:
+        combined = combined[:277].rstrip() + "..."
+    return f"This PDF appears to be about {combined}"
 
 
 def generate_answer_local(question, retrieved_chunks, generator, max_chunks=4, max_chars_per_chunk=450):
@@ -174,15 +240,30 @@ def generate_answer_local(question, retrieved_chunks, generator, max_chunks=4, m
     retrieved chunks and writes a grounded answer. No API key needed, but
     noticeably less capable than a hosted LLM.
     """
-    if not retrieved_chunks:
+    summary_mode = _looks_like_summary_question(question)
+    if not summary_mode and not _has_relevant_retrieval(retrieved_chunks):
         return {"answer": _NOT_FOUND_PHRASE, "pages": []}
 
-    context, pages = _build_context(retrieved_chunks, max_chunks, max_chars_per_chunk)
+    if generator is None:
+        return {
+            "answer": (
+                "Local generator not available. Try providing a Groq API key or "
+                "ensure the local model can be loaded (check transformers/torch installation)."
+            ),
+            "pages": [],
+        }
+
+    context, pages = _build_context(
+        retrieved_chunks,
+        max_chunks=6 if summary_mode else max_chunks,
+        max_chars_per_chunk=650 if summary_mode else max_chars_per_chunk,
+    )
 
     prompt = (
         "You are answering a question using only the context below, which "
-        "comes from a document. If the answer is not contained in the "
-        f"context, respond exactly with: \"{_NOT_FOUND_PHRASE}\". "
+        "comes from a document. If the question asks for a summary or overview, "
+        "give the best concise description you can from the context. "
+        f"If the answer is not contained in the context, respond exactly with: \"{_NOT_FOUND_PHRASE}\". "
         "Otherwise answer concisely in 1-3 sentences.\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n"
@@ -191,11 +272,20 @@ def generate_answer_local(question, retrieved_chunks, generator, max_chunks=4, m
 
     try:
         output = generator(prompt, max_new_tokens=150, do_sample=False)
-        answer_text = output[0]["generated_text"].strip()
-    except Exception:
-        answer_text = "Sorry, something went wrong generating an answer."
+        # transformers pipelines may return different keys depending on version
+        if isinstance(output, list) and output:
+            first = output[0]
+            answer_text = (first.get("generated_text") or first.get("text") or "").strip()
+        else:
+            answer_text = str(output).strip()
+    except Exception as e:
+        answer_text = f"Sorry, something went wrong generating an answer: {e}"
 
     not_found = _NOT_FOUND_PHRASE.lower() in answer_text.lower()
+    if summary_mode and not_found and pages:
+        return {"answer": _fallback_overview_from_context(context), "pages": pages}
+    if summary_mode and not not_found and pages:
+        return {"answer": answer_text, "pages": pages}
     return {"answer": answer_text, "pages": [] if not_found else pages}
 
 
@@ -208,13 +298,20 @@ def generate_answer_groq(question, retrieved_chunks, api_key, model=GROQ_DEFAULT
     if Groq is None:
         return {"answer": "The `groq` package isn't installed. Run: pip install groq", "pages": []}
 
-    if not retrieved_chunks:
+    summary_mode = _looks_like_summary_question(question)
+    if not summary_mode and not _has_relevant_retrieval(retrieved_chunks):
         return {"answer": _NOT_FOUND_PHRASE, "pages": []}
 
-    context, pages = _build_context(retrieved_chunks, max_chunks, max_chars_per_chunk)
+    context, pages = _build_context(
+        retrieved_chunks,
+        max_chunks=6 if summary_mode else max_chunks,
+        max_chars_per_chunk=900 if summary_mode else max_chars_per_chunk,
+    )
 
     system_prompt = (
         "You answer questions using ONLY the provided context from a document. "
+        "If the question asks for a summary, overview, or what the document is about, "
+        "give the best concise summary grounded in the context. "
         f"If the answer isn't in the context, reply exactly: \"{_NOT_FOUND_PHRASE}\" "
         "Otherwise, answer clearly and concisely, and mention which page(s) "
         "your answer came from using the [Page N] markers already in the context."
@@ -237,6 +334,10 @@ def generate_answer_groq(question, retrieved_chunks, api_key, model=GROQ_DEFAULT
         return {"answer": f"Groq API error: {e}", "pages": []}
 
     not_found = _NOT_FOUND_PHRASE.lower() in answer_text.lower()
+    if summary_mode and not_found and pages:
+        return {"answer": _fallback_overview_from_context(context), "pages": pages}
+    if summary_mode and not not_found and pages:
+        return {"answer": answer_text, "pages": pages}
     return {"answer": answer_text, "pages": [] if not_found else pages}
 
 

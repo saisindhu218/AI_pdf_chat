@@ -1,4 +1,5 @@
 import os
+import warnings
 import streamlit as st
 from dotenv import load_dotenv
 from rag_utils import (
@@ -14,13 +15,19 @@ from rag_utils import (
 
 load_dotenv()  # reads GROQ_API_KEY from a local .env file, if present
 
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=".*clean_up_tokenization_spaces.*",
+)
+
 st.set_page_config(page_title="AI PDF Chat (RAG)", page_icon="📄", layout="wide")
 
 st.title("📄 AI PDF Chat")
 st.caption(
-    "Upload a PDF, ask questions about it, and get answers grounded in the "
-    "document — with the source page(s) cited. Uses Groq's free hosted LLM "
-    "if you provide a key, or falls back to a small local model with no key needed."
+    "This app uses RAG first: it retrieves relevant PDF chunks, then generates a "
+    "grounded answer from those chunks. If a Groq key is available, Groq handles "
+    "answer generation; otherwise it falls back to a lightweight local model."
 )
 
 
@@ -46,13 +53,14 @@ def get_configured_groq_key():
 def get_embedder():
     return load_embedder()
 
-
-@st.cache_resource(show_spinner="Loading local fallback model (first run only, ~30-60s)...")
-def get_local_generator():
-    return load_local_generator()
-
-
-embedder = get_embedder()
+try:
+    embedder = get_embedder()
+except Exception as e:
+    st.error(
+        "Failed to load the embedding model. Check your environment and dependencies: "
+        f"{e}"
+    )
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Sidebar: upload + answer engine
@@ -75,14 +83,16 @@ with st.sidebar:
         groq_api_key = st.text_input(
             "Groq API key (optional)",
             type="password",
-            help="Free key from console.groq.com. Leave blank to use the local model instead.",
+            help="Free key from console.groq.com. Leave blank to use the local fallback instead.",
         )
         if groq_api_key:
             st.success(f"Using Groq ({GROQ_DEFAULT_MODEL}) for answers.")
         else:
-            st.info("No key found — using the local Flan-T5 model (free, lower quality).")
+            st.info("No key found — using the local lightweight fallback (free, lower quality).")
 
     engine = "groq" if groq_api_key else "local"
+    pipeline_label = f"RAG retrieval + {'Groq' if engine == 'groq' else 'local fallback'} generation"
+    st.info(f"Pipeline: {pipeline_label}")
 
     st.markdown("---")
     st.markdown(
@@ -90,9 +100,16 @@ with st.sidebar:
         "1. Extract text per page (PyMuPDF)\n"
         "2. Chunk + embed (MiniLM)\n"
         "3. Retrieve top-k chunks (FAISS)\n"
-        "4. Generate a grounded answer (Groq LLM or local Flan-T5)\n"
+        "4. Generate a grounded answer (Groq LLM or local fallback)\n"
         "5. Cite the source page(s) as text"
     )
+    st.markdown("---")
+    # Debug toggle: show retrieved chunks in the chat history when enabled.
+    show_retrieved = st.checkbox(
+        "Show retrieved chunks (debug)", value=False,
+        help="Display all retrieved chunks for debugging/transparency. Leave off for production."
+    )
+    st.session_state["show_retrieved"] = show_retrieved
 
 if uploaded_file is None:
     st.info("👈 Upload a PDF to get started.")
@@ -110,7 +127,14 @@ if "indexed_file_name" not in st.session_state or st.session_state.indexed_file_
         if not chunks:
             st.error("Couldn't extract any text from this PDF (it may be a scanned image without OCR).")
             st.stop()
-        index = build_index(chunks, embedder)
+        try:
+            index = build_index(chunks, embedder)
+        except Exception as e:
+            st.error(
+                "Failed to build vector index. Ensure FAISS and numpy are installed and compatible.\n"
+                f"Error: {e}"
+            )
+            st.stop()
 
     st.session_state.indexed_file_name = uploaded_file.name
     st.session_state.chunks = chunks
@@ -136,11 +160,19 @@ if question:
     with st.spinner("Retrieving relevant passages and generating an answer..."):
         retrieved = retrieve(question, chunks, index, embedder, top_k=top_k)
 
-        local_generator = None if engine == "groq" else get_local_generator()
+        generator_for_run = None
+        if engine == "local":
+            try:
+                generator_for_run = load_local_generator()
+            except Exception as e:
+                st.warning(
+                    "The local fallback model could not be loaded. Groq is unavailable, so the app will "
+                    f"return a retrieval-only fallback for this question. Error: {e}"
+                )
         result = generate_answer(
             question, retrieved,
             engine=engine,
-            local_generator=local_generator,
+            local_generator=generator_for_run,
             groq_api_key=groq_api_key,
         )
 
@@ -161,10 +193,12 @@ for turn in reversed(st.session_state.chat_history):
         st.markdown(result["answer"])
 
         caption_parts = [f"Engine: {turn['engine']}"]
+        caption_parts.append("Pipeline: RAG retrieval + answer generation")
         if result["pages"]:
             caption_parts.append("Source: page(s) " + ", ".join(str(p) for p in result["pages"]))
         st.caption(" · ".join(caption_parts))
 
-        with st.expander("🔍 All retrieved chunks (for debugging / transparency)"):
-            for r in turn["retrieved"]:
-                st.markdown(f"- **p.{r['page']}** (score {r['score']:.2f}): {r['text'][:200]}...")
+        if st.session_state.get("show_retrieved", False):
+            with st.expander("🔍 All retrieved chunks (for debugging / transparency)"):
+                for r in turn["retrieved"]:
+                    st.markdown(f"- **p.{r['page']}** (score {r['score']:.2f}): {r['text'][:200]}...")
