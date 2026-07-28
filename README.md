@@ -6,7 +6,6 @@ AI PDF Chat is a Retrieval-Augmented Generation (RAG) application that enables u
 
 The project supports both **Groq-hosted LLMs** for high-quality responses and a **fully local inference pipeline** using Flan-T5, allowing it to operate with or without external APIs.
 
----
 
 ## Features
 
@@ -22,7 +21,6 @@ The project supports both **Groq-hosted LLMs** for high-quality responses and a 
 - Secure API key management using environment variables
 - Deployable on Streamlit Community Cloud and Hugging Face Spaces
 
----
 
 ## System Architecture
 
@@ -59,7 +57,7 @@ The project supports both **Groq-hosted LLMs** for high-quality responses and a 
          Grounded Answer + Page Citation
 ```
 
----
+
 
 ## Technology Stack
 
@@ -86,7 +84,7 @@ The project supports both **Groq-hosted LLMs** for high-quality responses and a 
 
 - PyMuPDF
 
----
+
 
 ## Workflow
 
@@ -101,7 +99,6 @@ The project supports both **Groq-hosted LLMs** for high-quality responses and a 
    - Local Flan-T5 model.
 8. Display the answer along with the source page citation.
 
----
 
 ## Project Structure
 
@@ -116,7 +113,6 @@ AI_PDF_Chat/
 └── assets/
 ```
 
----
 
 ## Installation
 
@@ -139,7 +135,6 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
----
 
 ## Configuration
 
@@ -151,7 +146,6 @@ GROQ_API_KEY=your_groq_api_key
 
 If no API key is provided, the application automatically switches to the local Flan-T5 model.
 
----
 
 ## Example Questions
 
@@ -162,7 +156,6 @@ If no API key is provided, the application automatically switches to the local F
 - What skills are highlighted?
 - Which page discusses machine learning?
 
----
 
 ## Key Highlights
 
@@ -175,7 +168,6 @@ If no API key is provided, the application automatically switches to the local F
 - Page-Level Citations
 - Environment Variable-Based Secret Management
 
----
 
 ## Deployment
 
@@ -186,7 +178,6 @@ The application can be deployed on:
 
 For production deployments, store the Groq API key using the platform's Secrets Manager instead of hardcoding it.
 
----
 
 ## Future Enhancements
 
@@ -199,7 +190,6 @@ For production deployments, store the Groq API key using the platform's Secrets 
 - Multi-user authentication
 - Conversation memory
 
----
 
 ## Interview Discussion Points
 
@@ -216,13 +206,11 @@ Key engineering concepts include:
 - Local vs. Cloud inference trade-offs
 - Secure API key management
 
----
 
 ## License
 
 This project is licensed under the MIT License.
 
----
 
 ## Author
 
